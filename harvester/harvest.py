@@ -32,10 +32,17 @@ OUTPUT_PATH = Path(__file__).parent.parent / "data" / "games.json"
 
 TARGET_GAMES   = 6000   # stop discovery once we have this many unique games
 MAX_POOL       = 6000   # final pool size cap
-PAGES_PER_KW   = 4      # omni-search pages to pull per keyword
+SAMPLE_KEYWORDS = 350   # random words drawn from the big list per run
+PAGES_PER_KW   = 4      # omni-search result pages to collect per keyword
+PAGE1_KEEP     = 0.5    # of page 1 (the popular head), randomly keep this fraction
+                        # -> giants stay eligible but diluted, not taken wholesale.
+                        # deeper (niche) pages are always kept in full.
 MIN_PLAYERS    = 0      # live-player floor (0 = allow quiet games for variety)
 MIN_UPVOTES    = 30     # require a little community signal so games aren't dead
 MAX_MIN_AGE    = 13     # drop experiences whose minimum age is above this (family-safe-ish)
+MAX_VISITS     = 0      # optional popularity cap (0 = disabled; keep top games eligible)
+
+KEYWORDS_FILE  = Path(__file__).parent / "keywords.txt"
 
 OMNI_URL  = "https://apis.roblox.com/search-api/omni-search"
 GAMES_URL = "https://games.roblox.com/v1/games"
@@ -46,39 +53,29 @@ SESSION.headers.update({
     "Accept": "application/json",
 })
 
-# A broad, genre/theme/mechanic keyword list. Breadth here = variety in the
-# pool. Shuffled per-week so different slices surface each run.
-KEYWORDS = [
-    # genres / mechanics
+# A small curated genre set, always mixed in so every pool is guaranteed some
+# cleanly genre-taggable games. The BULK of each sweep comes from random words
+# sampled out of keywords.txt (~8.7k common English words) - searching obscure
+# words surfaces obscure, popularity-agnostic games, which is where real
+# randomness comes from. omni-search ranks each keyword popular-first, so we
+# also randomly skip the top page(s) per keyword to keep the giants from
+# dominating.
+GENRE_SEEDS = [
     "tycoon", "obby", "simulator", "rpg", "horror", "racing", "fighting",
-    "tower", "pet", "city", "war", "zombie", "survival", "roleplay", "story",
-    "adventure", "shooter", "fps", "parkour", "puzzle", "sandbox", "sports",
-    "soccer", "basketball", "football", "tower defense", "clicker", "idle",
-    "build", "battle", "arena", "pvp", "escape", "scary", "maze", "quiz",
-    "trivia", "music", "dance", "fashion", "dress up", "school", "life",
-    "family", "house", "home", "farm", "garden", "mining", "fishing",
-    "cooking", "restaurant", "cafe", "hotel", "prison", "police", "army",
-    "military", "space", "alien", "robot", "mech", "dragon", "magic",
-    "wizard", "ninja", "samurai", "pirate", "ocean", "island", "jungle",
-    "forest", "desert", "winter", "snow", "christmas", "halloween",
-    # themes / IP-adjacent / popular terms
-    "anime", "naruto", "dragon ball", "one piece", "pokemon", "sonic",
-    "mario", "minecraft", "fortnite", "among us", "squid game", "rainbow",
-    "gacha", "waifu", "kawaii", "cute", "aesthetic", "vibe", "hangout",
-    "chill", "trade", "trading", "collect", "merge", "evolution", "kingdom",
-    "empire", "medieval", "fantasy", "superhero", "hero", "villain",
-    "stealth", "spy", "detective", "murder", "mystery", "cart", "ride",
-    "rollercoaster", "theme park", "water park", "pool", "beach", "car",
-    "truck", "plane", "train", "boat", "bike", "drift", "speed", "race",
-    "jump", "fall", "climb", "run", "dash", "flee", "hide", "seek", "tag",
-    "infect", "outbreak", "apocalypse", "nuke", "doomsday", "bunker",
-    "craft", "smith", "potion", "spell", "summon", "boss", "raid", "dungeon",
-    "loot", "treasure", "gold", "diamond", "gem", "coin", "money", "rich",
-    "billionaire", "shop", "store", "mall", "market", "auction",
-    # single letters / short tokens widen the net
-    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
-    "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+    "tower", "pet", "survival", "roleplay", "adventure", "shooter", "parkour",
+    "puzzle", "sports", "tower defense", "clicker", "anime", "zombie",
+    "pirate", "dragon", "magic", "superhero", "mystery", "fantasy", "sandbox",
+    "escape", "dance", "farm",
 ]
+
+
+def load_word_pool():
+    """Load the bundled common-English-word list used as random keywords."""
+    try:
+        return [w.strip() for w in KEYWORDS_FILE.read_text().split() if w.strip()]
+    except FileNotFoundError:
+        print(f"  WARN: {KEYWORDS_FILE} missing - falling back to genre seeds only")
+        return []
 
 
 def week_seed():
@@ -125,12 +122,21 @@ def parse_games(payload):
 
 
 def discover():
-    """Sweep keywords through omni-search; return {universeId: raw_game}."""
+    """Sweep keywords through omni-search; return {universeId: raw_game}.
+
+    Keyword list = curated genre seeds + a random sample of common words,
+    shuffled with the per-week seed so each run searches a different mix.
+    omni-search ranks each keyword popular-first, so from page 1 (the popular
+    head) we randomly keep only PAGE1_KEEP of the results - giants stay
+    eligible but diluted, never grabbed wholesale in rank order. Deeper pages
+    (the niche tail) are kept in full."""
     found = {}
-    keywords = list(KEYWORDS)
+    pool = load_word_pool()
+    sample = random.sample(pool, min(SAMPLE_KEYWORDS, len(pool))) if pool else []
+    keywords = GENRE_SEEDS + sample
     random.shuffle(keywords)
-    print(f"[1/3] omni-search sweep over {len(keywords)} keywords "
-          f"(<= {PAGES_PER_KW} pages each), target {TARGET_GAMES:,}...")
+    print(f"[1/3] omni-search sweep: {len(GENRE_SEEDS)} genre seeds + "
+          f"{len(sample)} random words, target {TARGET_GAMES:,}...")
     for kw in keywords:
         if len(found) >= TARGET_GAMES:
             break
@@ -139,6 +145,10 @@ def discover():
         for page in range(PAGES_PER_KW):
             payload = omni_search(kw, token)
             games, token = parse_games(payload)
+            if page == 0 and len(games) > 1:
+                # randomly sample the popular head instead of taking it in order
+                random.shuffle(games)
+                games = games[:max(1, int(len(games) * PAGE1_KEEP))]
             for g in games:
                 uid = g["universeId"]
                 if uid not in found:
@@ -148,7 +158,7 @@ def discover():
                 break
             time.sleep(0.5)
         print(f"  '{kw}': +{added}  (pool={len(found)})")
-        time.sleep(0.5)
+        time.sleep(0.4)
     print(f"  discovery complete: {len(found):,} unique games")
     return found
 
@@ -187,7 +197,7 @@ def enrich(universe_ids):
 def build(found, meta):
     print("[3/3] filtering + assembling pool...")
     games = []
-    dropped_age = dropped_quality = no_place = 0
+    dropped_age = dropped_quality = no_place = dropped_popular = 0
     for uid, g in found.items():
         place = g.get("rootPlaceId")
         if not place:
@@ -203,6 +213,9 @@ def build(found, meta):
             continue
 
         m = meta.get(uid, {})
+        if MAX_VISITS and (m.get("visits", 0) or 0) > MAX_VISITS:
+            dropped_popular += 1
+            continue
         games.append({
             "title":       (g.get("name") or m.get("name") or "").strip(),
             "universeId":  uid,
@@ -221,7 +234,7 @@ def build(found, meta):
         games = games[:MAX_POOL]
 
     print(f"  kept {len(games):,}  |  dropped: age={dropped_age} "
-          f"quality={dropped_quality} no_place={no_place}")
+          f"quality={dropped_quality} no_place={no_place} popular={dropped_popular}")
     return games
 
 
