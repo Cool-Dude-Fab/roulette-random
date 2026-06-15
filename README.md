@@ -6,33 +6,42 @@ random-game picker.
 
 ## How it works
 
-A GitHub Actions workflow runs every Monday at 3am UTC:
-1. Sweeps a random sample of keywords through Roblox's `omni-search` API,
-   which returns real, played experiences (universeId, name, rootPlaceId,
-   live player count, votes, maturity) with everything we need inline. The
-   keywords are drawn from a bundled ~8.7k common-word list and shuffled with
-   a per-ISO-week seed, so every run surfaces a fresh random batch. From each
-   keyword's first (most-popular) page we keep only a random half, so giant
-   games stay eligible but don't dominate.
-2. Filters by maturity and a light community-signal floor, dedupes, shuffles,
-   caps to the pool size. All requests run concurrently across a thread pool.
-3. Commits the result to `data/games.json`
+Roblox's keyword search (`omni-search`) — the only API that surfaces deep,
+niche games — is blocked from datacenter IPs, so the work is split across two
+scripts:
 
-Discovery is intentionally the only network phase: omni-search already returns
-live players + votes, which are better freshness signals than lifetime visits.
-An optional enrichment pass (`ENRICH=True` in `harvest.py`) can backfill
-canonical `visits`/`genre`/`maxPlayers` from the `/v1/games` endpoint, but it's
-off by default because that endpoint is heavily rate-limited and Roblox's genre
-field is mostly empty.
+### `harvester/harvest.py` — niche discovery (run from home)
 
-The Roblox experience fetches `data/games.json` at server startup via HttpService.
+Sweeps a random sample of keywords through `omni-search`, which returns real,
+played experiences with live players + votes inline. Keywords are drawn from a
+bundled ~8.7k common-word list and shuffled with a per-ISO-week seed; from each
+keyword's most-popular page only a random half is kept, so giant games stay
+eligible but don't dominate. Filters maturity + a light community-signal floor,
+dedupes, caps, writes `data/games.json`. Runs concurrently in ~1.5 min.
 
-## Running manually
+This is the only step that needs a non-datacenter IP. Run it from your machine
+whenever you want to inject fresh *niche* games into the pool:
 
-To trigger a fresh harvest without waiting for the schedule:
-1. Go to **Actions** tab on GitHub
-2. Click **Harvest Game Pool**
-3. Click **Run workflow**
+```bash
+pip install requests
+python harvester/harvest.py
+git commit -am "refresh niche pool" && git push
+```
+
+### `harvester/refresh.py` — weekly upkeep (runs in GitHub Actions)
+
+A workflow runs every Monday at 3am UTC and, using only cloud-friendly APIs:
+1. Re-validates every game in the pool via `/v1/games` — drops removed/private
+   games (only when the API *confirms* they're gone) and refreshes live
+   `playing` count, `visits`, `genre`, and `maxPlayers`.
+2. Folds in Roblox's current `explore-api` trending / up-and-coming games.
+3. Caps, shuffles, commits `data/games.json`.
+
+Keeps the pool alive and current with zero manual effort. To run it on demand:
+**Actions** tab → **Weekly Pool Refresh** → **Run workflow**.
+
+The Roblox experience fetches `data/games.json` at server startup via HttpService
+and picks randomly from it on every spin.
 
 ## JSON format
 
@@ -51,5 +60,6 @@ Each entry in `data/games.json`:
 }
 ```
 
-`players`, `upVotes`, and `downVotes` come from omni-search and feed the
-planned community-rating ("Roulette Respected") features.
+`players` (live count), `upVotes`, and `downVotes` feed the spin UI and the
+planned community-rating ("Roulette Respected") features. `visits`/`genre`/
+`maxPlayers` are populated/refreshed by `refresh.py` via `/v1/games`.

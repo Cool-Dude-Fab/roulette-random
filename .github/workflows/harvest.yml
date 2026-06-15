@@ -1,12 +1,17 @@
-name: Harvest Game Pool
+name: Weekly Pool Refresh
 
 on:
   schedule:
     - cron: '0 3 * * 1'  # Every Monday at 3am UTC
   workflow_dispatch:       # Manual trigger from GitHub Actions tab
 
+# Niche discovery (harvest.py / omni-search) is blocked from datacenter IPs, so
+# the weekly cloud job runs refresh.py instead: it re-validates the pool and
+# folds in current explore-api trending games using only cloud-friendly APIs.
+# Run harvester/harvest.py from home to inject new niche games.
+
 jobs:
-  harvest:
+  refresh:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -23,8 +28,8 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run harvester
-        run: python harvester/harvest.py
+      - name: Refresh game pool
+        run: python harvester/refresh.py
 
       - name: Commit updated game pool
         run: |
@@ -32,5 +37,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/games.json
           git diff --staged --quiet && echo "No changes to commit" || \
-            git commit -m "chore: weekly game pool refresh $(date -u +%Y-%m-%d)"
+            git commit -m "chore: weekly pool refresh $(date -u +%Y-%m-%d)"
           git push
