@@ -1,229 +1,258 @@
 #!/usr/bin/env python3
 """
-Roulette Random — Game Pool Harvester
+Roulette Random - Game Pool Harvester
 Runs weekly via GitHub Actions.
-Discovers games via Roblox's recommendations API (BFS from diverse seeds),
-then batch-fetches metadata. Writes data/games.json.
+
+Fully automated, zero manual input. Each run:
+  1. Sweeps a large keyword list through Roblox's omni-search API, which
+     returns REAL, played games (universeId, name, rootPlaceId, live player
+     count, votes, maturity) - no junk personal places.
+  2. Enriches each game with canonical metadata (visits, genre, maxPlayers)
+     via the public /v1/games batch endpoint.
+  3. Filters by maturity + a light quality floor, dedupes, shuffles.
+  4. Writes data/games.json - the array the Roblox experience fetches at
+     startup to build its spin pool.
+
+The keyword list is shuffled with a per-ISO-week seed, so every weekly run
+produces a fresh random batch of experiences (and re-runs within the same
+week stay stable).
 """
 
+import datetime
 import json
 import random
 import sys
 import time
-from collections import deque
+import uuid
 from pathlib import Path
 
 import requests
 
+OUTPUT_PATH = Path(__file__).parent.parent / "data" / "games.json"
+
+TARGET_GAMES   = 6000   # stop discovery once we have this many unique games
+MAX_POOL       = 6000   # final pool size cap
+PAGES_PER_KW   = 4      # omni-search pages to pull per keyword
+MIN_PLAYERS    = 0      # live-player floor (0 = allow quiet games for variety)
+MIN_UPVOTES    = 30     # require a little community signal so games aren't dead
+MAX_MIN_AGE    = 13     # drop experiences whose minimum age is above this (family-safe-ish)
+
+OMNI_URL  = "https://apis.roblox.com/search-api/omni-search"
+GAMES_URL = "https://games.roblox.com/v1/games"
+
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; RouletteRandomHarvester/1.0)",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RouletteRandomHarvester/2.0",
     "Accept": "application/json",
 })
 
-OUTPUT_PATH = Path(__file__).parent.parent / "data" / "games.json"
-TARGET_IDS  = 15_000   # collect this many IDs before filtering
-TARGET_GAMES = 10_000  # final pool size after metadata filter
-MIN_VISITS  = 1_000
-
-# Diverse seed universe IDs spanning genres and popularity tiers
-SEEDS = [
-    223462836,   # Adopt Me!
-    2753915549,  # Blox Fruits
-    1537690962,  # Brookhaven RP
-    1060804,     # Tower of Hell
-    142823291,   # Murder Mystery 2
-    189106,      # Natural Disaster Survival
-    606849621,   # Jailbreak
-    10359919,    # MeepCity
-    192800,      # Work at a Pizza Place
-    735030788,   # Royale High
-    4680386299,  # Piggy
-    286090429,   # Arsenal
-    1730984664,  # Shindo Life
-    1962086868,  # Doors
-    1599679858,  # Pet Simulator X
-    4922741943,  # Islands
-    16732694052, # Fisch
-    234247886,   # Car Crushers 2
-    1536954679,  # Obby But You're on a Bike
-    2518745239,  # Anime Fighting Simulator X
-    5851073373,  # Sonic Speed Simulator
-    3959661290,  # Dragon Adventures
-    5120535452,  # Fruit Battlegrounds
-    3260590327,  # Bedwars
-    1705128720,  # Rainbow Friends
-    3233893879,  # Funky Friday
-    4483381587,  # Wacky Wizards
-    5550087938,  # Squid Game (popular fan game)
-    7415484311,  # The Mimic
-]
-
-# Intentionally diverse low-tier seeds to reach hidden gems via recommendations
-LOW_TIER_SEEDS = [
-    286090429,   # Arsenal (mid-tier shooter)
-    234247886,   # Car Crushers 2 (sandbox)
-    4922741943,  # Islands (building/survival)
-    189106,      # Natural Disaster Survival (classic)
-    192800,      # Work at a Pizza Place (classic)
+# A broad, genre/theme/mechanic keyword list. Breadth here = variety in the
+# pool. Shuffled per-week so different slices surface each run.
+KEYWORDS = [
+    # genres / mechanics
+    "tycoon", "obby", "simulator", "rpg", "horror", "racing", "fighting",
+    "tower", "pet", "city", "war", "zombie", "survival", "roleplay", "story",
+    "adventure", "shooter", "fps", "parkour", "puzzle", "sandbox", "sports",
+    "soccer", "basketball", "football", "tower defense", "clicker", "idle",
+    "build", "battle", "arena", "pvp", "escape", "scary", "maze", "quiz",
+    "trivia", "music", "dance", "fashion", "dress up", "school", "life",
+    "family", "house", "home", "farm", "garden", "mining", "fishing",
+    "cooking", "restaurant", "cafe", "hotel", "prison", "police", "army",
+    "military", "space", "alien", "robot", "mech", "dragon", "magic",
+    "wizard", "ninja", "samurai", "pirate", "ocean", "island", "jungle",
+    "forest", "desert", "winter", "snow", "christmas", "halloween",
+    # themes / IP-adjacent / popular terms
+    "anime", "naruto", "dragon ball", "one piece", "pokemon", "sonic",
+    "mario", "minecraft", "fortnite", "among us", "squid game", "rainbow",
+    "gacha", "waifu", "kawaii", "cute", "aesthetic", "vibe", "hangout",
+    "chill", "trade", "trading", "collect", "merge", "evolution", "kingdom",
+    "empire", "medieval", "fantasy", "superhero", "hero", "villain",
+    "stealth", "spy", "detective", "murder", "mystery", "cart", "ride",
+    "rollercoaster", "theme park", "water park", "pool", "beach", "car",
+    "truck", "plane", "train", "boat", "bike", "drift", "speed", "race",
+    "jump", "fall", "climb", "run", "dash", "flee", "hide", "seek", "tag",
+    "infect", "outbreak", "apocalypse", "nuke", "doomsday", "bunker",
+    "craft", "smith", "potion", "spell", "summon", "boss", "raid", "dungeon",
+    "loot", "treasure", "gold", "diamond", "gem", "coin", "money", "rich",
+    "billionaire", "shop", "store", "mall", "market", "auction",
+    # single letters / short tokens widen the net
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+    "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
 ]
 
 
-def fetch_json(url, params=None, retries=3):
+def week_seed():
+    """Deterministic-per-ISO-week seed so re-runs in the same week match,
+    but each new week reshuffles to a fresh batch."""
+    iso = datetime.date.today().isocalendar()
+    return iso[0] * 100 + iso[1]
+
+
+def omni_search(query, page_token=None, retries=4):
+    params = {"searchQuery": query, "sessionId": SESSION_ID, "pageType": "Game"}
+    if page_token:
+        params["pageToken"] = page_token
     for attempt in range(retries):
         try:
-            resp = SESSION.get(url, params=params, timeout=15)
-            if resp.status_code == 200:
-                return resp.json()
-            if resp.status_code == 429:
-                wait = 2 ** (attempt + 2)
-                print(f"  Rate limited — waiting {wait}s...")
-                time.sleep(wait)
-            else:
-                print(f"  HTTP {resp.status_code} for {url}")
-                return None
+            r = SESSION.get(OMNI_URL, params=params, timeout=20)
         except Exception as e:
-            print(f"  Request error: {e}")
+            print(f"    omni '{query}' error: {e}")
             time.sleep(2)
+            continue
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code == 429:
+            wait = 2 ** (attempt + 1)
+            time.sleep(wait)
+            continue
+        # other errors: brief pause, give up after retries
+        time.sleep(1)
     return None
 
 
-def get_recommendations(universe_id, max_rows=50):
-    """Fetch recommendation universe IDs for a given game."""
-    data = fetch_json(
-        "https://games.roblox.com/v1/games/recommendations/algorithm/2",
-        params={"maxRows": max_rows, "targetUniverseId": universe_id},
-    )
-    if not data or not data.get("games"):
-        return []
-    return [g["universeId"] for g in data["games"] if g.get("universeId")]
-
-
-def get_sorts_games():
-    """Pull game IDs from Roblox home-page sort lists."""
-    ids = set()
-    data = fetch_json(
-        "https://games.roblox.com/v1/games/sorts",
-        params={"gameSortsContext": "GamesDefaultSorts"},
-    )
-    if not data:
-        return ids
-    sorts = data.get("sorts") or []
-    for sort in sorts:
-        token = sort.get("token")
-        if not token:
+def parse_games(payload):
+    """Yield raw game dicts from an omni-search payload, plus the next token."""
+    out = []
+    if not payload:
+        return out, None
+    for grp in payload.get("searchResults", []):
+        if grp.get("contentGroupType") != "Game":
             continue
-        games = sort.get("games") or []
-        for g in games:
-            uid = g.get("universeId")
-            if uid:
-                ids.add(uid)
-    return ids
+        for g in grp.get("contents", []):
+            if g.get("universeId"):
+                out.append(g)
+    return out, payload.get("nextPageToken")
 
 
-def fetch_metadata(universe_ids):
-    """Batch-fetch game metadata for up to 100 IDs per request."""
-    results = []
-    ids_list = list(universe_ids)
-    for i in range(0, len(ids_list), 100):
-        batch = ids_list[i : i + 100]
-        data = fetch_json(
-            "https://games.roblox.com/v1/games",
-            params={"universeIds": ",".join(str(x) for x in batch)},
-        )
-        if data and data.get("data"):
-            results.extend(data["data"])
+def discover():
+    """Sweep keywords through omni-search; return {universeId: raw_game}."""
+    found = {}
+    keywords = list(KEYWORDS)
+    random.shuffle(keywords)
+    print(f"[1/3] omni-search sweep over {len(keywords)} keywords "
+          f"(<= {PAGES_PER_KW} pages each), target {TARGET_GAMES:,}...")
+    for kw in keywords:
+        if len(found) >= TARGET_GAMES:
+            break
+        token = None
+        added = 0
+        for page in range(PAGES_PER_KW):
+            payload = omni_search(kw, token)
+            games, token = parse_games(payload)
+            for g in games:
+                uid = g["universeId"]
+                if uid not in found:
+                    found[uid] = g
+                    added += 1
+            if not token:
+                break
+            time.sleep(0.5)
+        print(f"  '{kw}': +{added}  (pool={len(found)})")
+        time.sleep(0.5)
+    print(f"  discovery complete: {len(found):,} unique games")
+    return found
+
+
+def enrich(universe_ids):
+    """Batch-fetch canonical metadata (visits, genre, maxPlayers). Best effort:
+    universes that fail simply fall back to omni-search data."""
+    meta = {}
+    ids = list(universe_ids)
+    print(f"[2/3] enriching {len(ids):,} games via /v1/games (batches of 50)...")
+    for i in range(0, len(ids), 50):
+        batch = ids[i:i + 50]
+        for attempt in range(4):
+            try:
+                r = SESSION.get(GAMES_URL,
+                                params={"universeIds": ",".join(map(str, batch))},
+                                timeout=20)
+            except Exception:
+                time.sleep(2)
+                continue
+            if r.status_code == 200:
+                for e in r.json().get("data", []):
+                    meta[e.get("id")] = e
+                break
+            if r.status_code == 429:
+                time.sleep(2 ** (attempt + 1))
+                continue
+            break
+        if (i // 50) % 20 == 0:
+            print(f"  enriched ~{min(i + 50, len(ids)):,}/{len(ids):,}")
         time.sleep(0.4)
-    return results
+    print(f"  enrichment complete: {len(meta):,} resolved")
+    return meta
+
+
+def build(found, meta):
+    print("[3/3] filtering + assembling pool...")
+    games = []
+    dropped_age = dropped_quality = no_place = 0
+    for uid, g in found.items():
+        place = g.get("rootPlaceId")
+        if not place:
+            no_place += 1
+            continue
+        if (g.get("minimumAge") or 0) > MAX_MIN_AGE:
+            dropped_age += 1
+            continue
+        up = g.get("totalUpVotes", 0) or 0
+        players = g.get("playerCount", 0) or 0
+        if players < MIN_PLAYERS or up < MIN_UPVOTES:
+            dropped_quality += 1
+            continue
+
+        m = meta.get(uid, {})
+        games.append({
+            "title":       (g.get("name") or m.get("name") or "").strip(),
+            "universeId":  uid,
+            "rootPlaceId": place,
+            "visits":      m.get("visits", 0) or 0,
+            "genre":       m.get("genre") or "All",
+            "maxPlayers":  m.get("maxPlayers", 0) or 0,
+            "players":     players,
+            "upVotes":     up,
+            "downVotes":   g.get("totalDownVotes", 0) or 0,
+        })
+
+    games = [g for g in games if g["title"]]
+    random.shuffle(games)
+    if len(games) > MAX_POOL:
+        games = games[:MAX_POOL]
+
+    print(f"  kept {len(games):,}  |  dropped: age={dropped_age} "
+          f"quality={dropped_quality} no_place={no_place}")
+    return games
 
 
 def main():
-    print("=== Roulette Random — Game Pool Harvester ===")
+    print("=== Roulette Random - Game Pool Harvester (omni-search) ===")
+    random.seed(week_seed())
+    print(f"week seed: {week_seed()}")
 
-    # Clean seed list (remove any bad entries)
-    seeds = [s for s in SEEDS if isinstance(s, int)]
+    found = discover()
+    if not found:
+        print("ERROR: discovery returned nothing - API may have changed")
+        sys.exit(1)
 
-    all_ids = set(seeds)
-    queue = deque(seeds)
-    visited = set()
+    meta = enrich(found.keys())
+    games = build(found, meta)
 
-    # Phase 1: home-page sorts (instant, no BFS cost)
-    print("\n[1/3] Pulling home-page sort lists...")
-    sort_ids = get_sorts_games()
-    all_ids.update(sort_ids)
-    # Add sort games as BFS seeds too
-    queue.extend(s for s in sort_ids if s not in visited)
-    print(f"  Got {len(sort_ids)} IDs from sorts  |  total={len(all_ids)}")
-
-    # Phase 2: BFS recommendation chain
-    print(f"\n[2/3] BFS recommendation chain (target: {TARGET_IDS:,} IDs)...")
-    while queue and len(all_ids) < TARGET_IDS:
-        uid = queue.popleft()
-        if uid in visited:
-            continue
-        visited.add(uid)
-
-        recs = get_recommendations(uid, max_rows=50)
-        new = [r for r in recs if r not in all_ids]
-        all_ids.update(recs)
-        for r in new:
-            queue.append(r)
-
-        if len(visited) % 25 == 0:
-            print(f"  Visited={len(visited):5d}  Pool={len(all_ids):6d}  Queue={len(queue):6d}")
-
-        time.sleep(0.35)
-
-    print(f"\nTotal unique IDs collected: {len(all_ids)}")
-
-    # Phase 3: batch metadata + filter
-    print(f"\n[3/3] Fetching metadata (min {MIN_VISITS:,} visits)...")
-    raw = fetch_metadata(all_ids)
-
-    games = []
-    for entry in raw:
-        uid   = entry.get("id")
-        pid   = entry.get("rootPlaceId")
-        title = (entry.get("name") or "").strip()
-        visits = entry.get("visits", 0)
-
-        if not uid or not pid or not title:
-            continue
-        if visits < MIN_VISITS:
-            continue
-
-        games.append({
-            "title":       title,
-            "universeId":  uid,
-            "rootPlaceId": pid,
-            "visits":      visits,
-            "genre":       entry.get("genre") or "All",
-            "maxPlayers":  entry.get("maxPlayers") or 0,
-        })
-
-    # Balanced pool: top half by visits + random sample from the rest
-    games.sort(key=lambda g: g["visits"], reverse=True)
-    if len(games) > TARGET_GAMES:
-        top  = games[: TARGET_GAMES // 2]
-        rest = games[TARGET_GAMES // 2 :]
-        random.shuffle(rest)
-        games = top + rest[: TARGET_GAMES // 2]
-
-    random.shuffle(games)
+    if len(games) < 100:
+        print(f"ERROR: only {len(games)} games - aborting to avoid a thin pool")
+        sys.exit(1)
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-        json.dump(games, f, separators=(",", ":"))
+        json.dump(games, f, separators=(",", ":"), ensure_ascii=False)
 
     size_kb = OUTPUT_PATH.stat().st_size / 1024
-    print(f"\nFinal pool: {len(games)} games  |  {size_kb:.1f} KB  →  {OUTPUT_PATH}")
+    print(f"\nWROTE {len(games):,} games -> {OUTPUT_PATH}  ({size_kb:.1f} KB)")
+    print("Done.")
 
-    if len(games) < 50:
-        print("ERROR: Too few games collected — API may have changed")
-        sys.exit(1)
 
-    print("Done!")
-
+# one session id reused for the whole run (omni-search expects a stable id)
+SESSION_ID = str(uuid.uuid4())
 
 if __name__ == "__main__":
     main()
