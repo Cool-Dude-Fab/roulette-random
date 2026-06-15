@@ -67,4 +67,28 @@ probe("games-api charts get-sort-content",
       "https://apis.roblox.com/explore-api/v1/get-sort-content",
       {"sessionId": SID, "sortId": "top-trending"})
 
+def throttle_rate(spacing):
+    """Send 8 omni-search requests `spacing` seconds apart; report success rate."""
+    ok = 0
+    codes = []
+    for i in range(8):
+        try:
+            r = S.get("https://apis.roblox.com/search-api/omni-search",
+                      params={"searchQuery": "obby" + str(i), "sessionId": SID,
+                              "pageType": "Game"}, timeout=20)
+            codes.append(r.status_code)
+            if r.status_code == 200:
+                ok += 1
+        except Exception as e:
+            codes.append("ERR")
+        if i < 7:
+            time.sleep(spacing)
+    print(f"\n## omni sustainable rate @ {spacing}s spacing: {ok}/8 ok  {codes}")
+
+
+print("\n--- omni-search throttle window test ---")
+throttle_rate(3)
+throttle_rate(8)
+throttle_rate(15)
+
 print("\n=== probe complete ===")
