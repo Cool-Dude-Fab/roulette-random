@@ -7,15 +7,23 @@ random-game picker.
 ## How it works
 
 A GitHub Actions workflow runs every Monday at 3am UTC:
-1. Sweeps a large keyword list through Roblox's `omni-search` API, which
-   returns real, played experiences (universeId, name, rootPlaceId, live
-   player count, votes, maturity) with metadata inline. The keyword list is
-   shuffled with a per-ISO-week seed, so every run surfaces a fresh random
-   batch of games.
-2. Enriches each game with canonical metadata (visits, genre, maxPlayers)
-   via the public `/v1/games` batch endpoint.
-3. Filters by maturity and a light community-signal floor, dedupes, shuffles.
-4. Commits the result to `data/games.json`
+1. Sweeps a random sample of keywords through Roblox's `omni-search` API,
+   which returns real, played experiences (universeId, name, rootPlaceId,
+   live player count, votes, maturity) with everything we need inline. The
+   keywords are drawn from a bundled ~8.7k common-word list and shuffled with
+   a per-ISO-week seed, so every run surfaces a fresh random batch. From each
+   keyword's first (most-popular) page we keep only a random half, so giant
+   games stay eligible but don't dominate.
+2. Filters by maturity and a light community-signal floor, dedupes, shuffles,
+   caps to the pool size. All requests run concurrently across a thread pool.
+3. Commits the result to `data/games.json`
+
+Discovery is intentionally the only network phase: omni-search already returns
+live players + votes, which are better freshness signals than lifetime visits.
+An optional enrichment pass (`ENRICH=True` in `harvest.py`) can backfill
+canonical `visits`/`genre`/`maxPlayers` from the `/v1/games` endpoint, but it's
+off by default because that endpoint is heavily rate-limited and Roblox's genre
+field is mostly empty.
 
 The Roblox experience fetches `data/games.json` at server startup via HttpService.
 

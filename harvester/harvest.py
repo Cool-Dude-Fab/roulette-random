@@ -24,6 +24,7 @@ import random
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -32,13 +33,20 @@ OUTPUT_PATH = Path(__file__).parent.parent / "data" / "games.json"
 
 TARGET_GAMES   = 6000   # stop discovery once we have this many unique games
 MAX_POOL       = 6000   # final pool size cap
+WORKERS        = 8      # concurrent HTTP requests (I/O-bound)
+ENRICH         = False  # fetch visits/genre/maxPlayers via /v1/games. Off by
+                        # default: it's the most rate-throttled phase and genre
+                        # is ~82% useless "All"; omni already gives us live
+                        # players + votes, which are better signals anyway.
+KEYWORDS_PER_RUN = 120  # keywords actually swept per run (enough to hit target)
 SAMPLE_KEYWORDS = 350   # random words drawn from the big list per run
-PAGES_PER_KW   = 4      # omni-search result pages to collect per keyword
+PAGES_PER_KW   = 3      # omni-search result pages to collect per keyword
 PAGE1_KEEP     = 0.5    # of page 1 (the popular head), randomly keep this fraction
                         # -> giants stay eligible but diluted, not taken wholesale.
                         # deeper (niche) pages are always kept in full.
 MIN_PLAYERS    = 0      # live-player floor (0 = allow quiet games for variety)
-MIN_UPVOTES    = 30     # require a little community signal so games aren't dead
+MIN_UPVOTES    = 10     # light community-signal floor so games aren't dead/broken,
+                        # low enough to keep the niche tail we actually want
 MAX_MIN_AGE    = 13     # drop experiences whose minimum age is above this (family-safe-ish)
 MAX_VISITS     = 0      # optional popularity cap (0 = disabled; keep top games eligible)
 
@@ -99,11 +107,10 @@ def omni_search(query, page_token=None, retries=4):
         if r.status_code == 200:
             return r.json()
         if r.status_code == 429:
-            wait = 2 ** (attempt + 1)
-            time.sleep(wait)
+            time.sleep(1 + attempt)   # gentle linear backoff: 1,2,3,4s
             continue
         # other errors: brief pause, give up after retries
-        time.sleep(1)
+        time.sleep(0.5)
     return None
 
 
@@ -121,97 +128,125 @@ def parse_games(payload):
     return out, payload.get("nextPageToken")
 
 
-def discover():
-    """Sweep keywords through omni-search; return {universeId: raw_game}.
+def fetch_keyword(kw):
+    """Walk one keyword's omni-search pages; return its raw game dicts.
 
-    Keyword list = curated genre seeds + a random sample of common words,
-    shuffled with the per-week seed so each run searches a different mix.
     omni-search ranks each keyword popular-first, so from page 1 (the popular
     head) we randomly keep only PAGE1_KEEP of the results - giants stay
     eligible but diluted, never grabbed wholesale in rank order. Deeper pages
-    (the niche tail) are kept in full."""
-    found = {}
+    (the niche tail) are kept in full. Runs in its own thread."""
+    out = []
+    token = None
+    for page in range(PAGES_PER_KW):
+        payload = omni_search(kw, token)
+        games, token = parse_games(payload)
+        if page == 0 and len(games) > 1:
+            random.shuffle(games)
+            games = games[:max(1, int(len(games) * PAGE1_KEEP))]
+        out.extend(games)
+        if not token:
+            break
+    return out
+
+
+def discover():
+    """Sweep keywords through omni-search CONCURRENTLY; return {uid: raw_game}.
+
+    Keyword list = curated genre seeds + a random sample of common words,
+    shuffled with the per-week seed so each run searches a different mix. Each
+    keyword's full pagination chain runs as one worker across a thread pool."""
     pool = load_word_pool()
     sample = random.sample(pool, min(SAMPLE_KEYWORDS, len(pool))) if pool else []
     keywords = GENRE_SEEDS + sample
     random.shuffle(keywords)
-    print(f"[1/3] omni-search sweep: {len(GENRE_SEEDS)} genre seeds + "
-          f"{len(sample)} random words, target {TARGET_GAMES:,}...")
-    for kw in keywords:
-        if len(found) >= TARGET_GAMES:
-            break
-        token = None
-        added = 0
-        for page in range(PAGES_PER_KW):
-            payload = omni_search(kw, token)
-            games, token = parse_games(payload)
-            if page == 0 and len(games) > 1:
-                # randomly sample the popular head instead of taking it in order
-                random.shuffle(games)
-                games = games[:max(1, int(len(games) * PAGE1_KEEP))]
+    keywords = keywords[:KEYWORDS_PER_RUN]
+
+    found = {}
+    print(f"[1/3] omni-search sweep: {len(keywords)} keywords "
+          f"x{WORKERS} workers, target {TARGET_GAMES:,}...")
+    done = 0
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futures = {ex.submit(fetch_keyword, kw): kw for kw in keywords}
+        for fut in as_completed(futures):
+            done += 1
+            try:
+                games = fut.result()
+            except Exception as e:
+                print(f"  '{futures[fut]}' failed: {e}")
+                continue
             for g in games:
-                uid = g["universeId"]
-                if uid not in found:
-                    found[uid] = g
-                    added += 1
-            if not token:
-                break
-            time.sleep(0.5)
-        print(f"  '{kw}': +{added}  (pool={len(found)})")
-        time.sleep(0.4)
+                found[g["universeId"]] = g
+            if done % 20 == 0:
+                print(f"  swept {done}/{len(keywords)} keywords  pool={len(found):,}")
     print(f"  discovery complete: {len(found):,} unique games")
     return found
 
 
+def fetch_meta_batch(batch):
+    """Fetch canonical metadata for up to 50 universe IDs. Runs in a thread."""
+    for attempt in range(4):
+        try:
+            r = SESSION.get(GAMES_URL,
+                            params={"universeIds": ",".join(map(str, batch))},
+                            timeout=20)
+        except Exception:
+            time.sleep(2)
+            continue
+        if r.status_code == 200:
+            return r.json().get("data", [])
+        if r.status_code == 429:
+            time.sleep(1 + attempt)   # gentle linear backoff: 1,2,3,4s
+            continue
+        break
+    return []
+
+
 def enrich(universe_ids):
-    """Batch-fetch canonical metadata (visits, genre, maxPlayers). Best effort:
-    universes that fail simply fall back to omni-search data."""
+    """Concurrently batch-fetch canonical metadata (visits, genre, maxPlayers).
+    Best effort: universes that fail simply fall back to omni-search data."""
     meta = {}
     ids = list(universe_ids)
-    print(f"[2/3] enriching {len(ids):,} games via /v1/games (batches of 50)...")
-    for i in range(0, len(ids), 50):
-        batch = ids[i:i + 50]
-        for attempt in range(4):
-            try:
-                r = SESSION.get(GAMES_URL,
-                                params={"universeIds": ",".join(map(str, batch))},
-                                timeout=20)
-            except Exception:
-                time.sleep(2)
-                continue
-            if r.status_code == 200:
-                for e in r.json().get("data", []):
-                    meta[e.get("id")] = e
-                break
-            if r.status_code == 429:
-                time.sleep(2 ** (attempt + 1))
-                continue
-            break
-        if (i // 50) % 20 == 0:
-            print(f"  enriched ~{min(i + 50, len(ids)):,}/{len(ids):,}")
-        time.sleep(0.4)
+    batches = [ids[i:i + 50] for i in range(0, len(ids), 50)]
+    print(f"[2/3] enriching {len(ids):,} games via /v1/games "
+          f"({len(batches)} batches x{WORKERS} workers)...")
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        for data in ex.map(fetch_meta_batch, batches):
+            for e in data:
+                meta[e.get("id")] = e
     print(f"  enrichment complete: {len(meta):,} resolved")
     return meta
 
 
-def build(found, meta):
-    print("[3/3] filtering + assembling pool...")
-    games = []
-    dropped_age = dropped_quality = no_place = dropped_popular = 0
-    for uid, g in found.items():
-        place = g.get("rootPlaceId")
-        if not place:
-            no_place += 1
-            continue
-        if (g.get("minimumAge") or 0) > MAX_MIN_AGE:
-            dropped_age += 1
-            continue
-        up = g.get("totalUpVotes", 0) or 0
-        players = g.get("playerCount", 0) or 0
-        if players < MIN_PLAYERS or up < MIN_UPVOTES:
-            dropped_quality += 1
-            continue
+def omni_ok(g):
+    """Cheap quality gate using only omni-search fields (no enrich needed)."""
+    if not g.get("rootPlaceId"):
+        return False
+    if (g.get("minimumAge") or 0) > MAX_MIN_AGE:
+        return False
+    if (g.get("playerCount", 0) or 0) < MIN_PLAYERS:
+        return False
+    if (g.get("totalUpVotes", 0) or 0) < MIN_UPVOTES:
+        return False
+    return bool((g.get("name") or "").strip())
 
+
+def select(found):
+    """Filter on omni fields and cap to MAX_POOL BEFORE the costly enrich step,
+    so we only fetch metadata for games that will actually make the pool."""
+    cands = [g for g in found.values() if omni_ok(g)]
+    random.shuffle(cands)
+    capped = cands[:MAX_POOL]
+    print(f"  {len(cands):,} pass omni filters -> keeping {len(capped):,} "
+          f"(capped to MAX_POOL)")
+    return capped
+
+
+def build(candidates, meta):
+    print("[3/3] assembling pool...")
+    games = []
+    dropped_popular = 0
+    for g in candidates:
+        uid = g["universeId"]
         m = meta.get(uid, {})
         if MAX_VISITS and (m.get("visits", 0) or 0) > MAX_VISITS:
             dropped_popular += 1
@@ -219,22 +254,16 @@ def build(found, meta):
         games.append({
             "title":       (g.get("name") or m.get("name") or "").strip(),
             "universeId":  uid,
-            "rootPlaceId": place,
+            "rootPlaceId": g["rootPlaceId"],
             "visits":      m.get("visits", 0) or 0,
             "genre":       m.get("genre") or "All",
             "maxPlayers":  m.get("maxPlayers", 0) or 0,
-            "players":     players,
-            "upVotes":     up,
+            "players":     g.get("playerCount", 0) or 0,
+            "upVotes":     g.get("totalUpVotes", 0) or 0,
             "downVotes":   g.get("totalDownVotes", 0) or 0,
         })
-
-    games = [g for g in games if g["title"]]
     random.shuffle(games)
-    if len(games) > MAX_POOL:
-        games = games[:MAX_POOL]
-
-    print(f"  kept {len(games):,}  |  dropped: age={dropped_age} "
-          f"quality={dropped_quality} no_place={no_place} popular={dropped_popular}")
+    print(f"  final pool: {len(games):,}  (popular-capped {dropped_popular})")
     return games
 
 
@@ -248,8 +277,11 @@ def main():
         print("ERROR: discovery returned nothing - API may have changed")
         sys.exit(1)
 
-    meta = enrich(found.keys())
-    games = build(found, meta)
+    candidates = select(found)
+    meta = enrich([g["universeId"] for g in candidates]) if ENRICH else {}
+    if not ENRICH:
+        print("[2/3] enrichment disabled (ENRICH=False) - using omni data only")
+    games = build(candidates, meta)
 
     if len(games) < 100:
         print(f"ERROR: only {len(games)} games - aborting to avoid a thin pool")
