@@ -32,7 +32,10 @@ import requests
 
 POOL_PATH   = Path(__file__).parent.parent / "data" / "games.json"
 MAX_POOL    = 8000   # pool cap (existing niche pool + trending top-ups)
-WORKERS     = 8
+WORKERS     = 8      # explore-api fetches (light)
+VALIDATE_WORKERS = 3 # /v1/games validation: LOW on purpose - it throttles hard
+                     # under burst load even from the cloud, but tolerates a
+                     # steady low-concurrency stream, which confirms ~everything
 MAX_MIN_AGE = 13     # maturity gate for newly-added explore games
 MIN_KEEP    = 100    # safety: never overwrite the pool with fewer than this
 
@@ -123,7 +126,7 @@ def validate(uids):
     batches = [ids[i:i + 50] for i in range(0, len(ids), 50)]
     meta = {}
     queried = set()
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+    with ThreadPoolExecutor(max_workers=VALIDATE_WORKERS) as ex:
         for batch, (ok, arr) in ex.map(lambda b: (b, fetch_meta_batch(b)), batches):
             if not ok:
                 continue
